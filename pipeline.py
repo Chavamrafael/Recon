@@ -12,7 +12,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 import uuid
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
+
+INDEXES = ['SP500', 'DJIA', 'DJCA', 'DJTA', 'DJUA']
 
 
 class PipelineConfig:
@@ -44,21 +46,6 @@ class PipelineConfig:
                         }
         except Exception as e:
             print(f"Warning: Failed to load config file {file_path}: {e}")
-    
-    def get_threshold(self, index: str, check_type: str) -> float:
-        """Get threshold for index and check type.
-        
-        Priority: index-specific override > global > default
-        """
-        if index in self.index_overrides:
-            override = self.index_overrides[index].get(check_type)
-            if override is not None:
-                return override
-        
-        if check_type == 'daily':
-            return self.global_daily
-        else:
-            return self.global_weekly
 
 
 class StockDataProcessor:
@@ -74,14 +61,12 @@ class StockDataProcessor:
         self.index_overrides = index_overrides or {}
     
     def _get_threshold(self, index: str, check_type: str) -> float:
-        """Get effective threshold considering CLI overrides."""
-        # Priority: index-specific CLI > global CLI override > config
-        if check_type == 'daily' and index in self.index_overrides:
-            val = self.index_overrides[index]['daily']
-            if val is not None:
-                return val
-        if check_type == 'weekly' and index in self.index_overrides:
-            val = self.index_overrides[index]['weekly']
+        """Get effective threshold considering CLI overrides.
+        
+        Priority: index-specific CLI > global CLI override > config file
+        """
+        if index in self.index_overrides:
+            val = self.index_overrides[index].get(check_type)
             if val is not None:
                 return val
         
@@ -90,83 +75,81 @@ class StockDataProcessor:
         if check_type == 'weekly' and self.weekly_override is not None:
             return self.weekly_override
         
-        return self.config.get_threshold(index, check_type)
+        if index in self.config.index_overrides:
+            override = self.config.index_overrides[index].get(check_type)
+            if override is not None:
+                return override
+        
+        return self.config.global_daily if check_type == 'daily' else self.config.global_weekly
+    
+    def _perform_check(self, df: pd.DataFrame, index_name: str, check_type: str,
+                       get_comparison: callable) -> List[Dict]:
+        """Perform a single type of check (daily or weekly) on the dataframe."""
+        threshold = self._get_threshold(index_name, check_type)
+        violations = []
+        
+        for i in range(len(df)):
+            comparison = get_comparison(df, i)
+            if comparison is None:
+                continue
+            
+            curr_date, curr_price, prev_date, prev_price = comparison
+            pct_change = ((curr_price - prev_price) / prev_price) * 100
+            
+            if abs(pct_change) > threshold:
+                violations.append({
+                    'type': check_type,
+                    'date': curr_date,
+                    'compared_date': prev_date,
+                    'date_val': curr_price,
+                    'compared_date_val': prev_price,
+                    'value_difference': curr_price - prev_price,
+                    'pct_change': round(pct_change, 2)
+                })
+        
+        return violations
+    
+    def _get_daily_comparison(self, df: pd.DataFrame, i: int) -> Optional[Tuple]:
+        """Get comparison for daily check."""
+        if i == 0:
+            return None
+        return (df.loc[i, 'date'], df.loc[i, 'price'],
+                df.loc[i-1, 'date'], df.loc[i-1, 'price'])
+    
+    def _get_weekly_comparison(self, df: pd.DataFrame, i: int) -> Optional[Tuple]:
+        """Get comparison for weekly check."""
+        curr_date = df.loc[i, 'date']
+        target_date = curr_date - timedelta(days=7)
+        prev_rows = df[df['date'] <= target_date]
+        
+        if len(prev_rows) == 0:
+            return None
+        
+        prev_idx = prev_rows.index[-1]
+        return (curr_date, df.loc[i, 'price'],
+                df.loc[prev_idx, 'date'], df.loc[prev_idx, 'price'])
     
     def process_file(self, file_path: str, index_name: str) -> Tuple[pd.DataFrame, Dict]:
         """Process a single CSV file and return violations."""
         try:
             df = pd.read_csv(file_path)
             
-            # Validate structure
             if len(df.columns) != 2:
                 return None, {'error': f"CSV must have exactly 2 columns, found {len(df.columns)}"}
             
-            date_col, price_col = df.columns
-            
-            # Rename for consistency
             df.columns = ['date', 'price']
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df['price'] = pd.to_numeric(df['price'], errors='coerce')
-            
-            # Remove rows with missing dates or prices
             df = df.dropna(subset=['date', 'price'])
             df = df.sort_values('date').reset_index(drop=True)
             
             violations = []
             
-            # Daily checks
             if self.daily_check:
-                daily_threshold = self._get_threshold(index_name, 'daily')
-                for i in range(1, len(df)):
-                    curr_date = df.loc[i, 'date']
-                    prev_date = df.loc[i-1, 'date']
-                    curr_price = df.loc[i, 'price']
-                    prev_price = df.loc[i-1, 'price']
-                    
-                    pct_change = ((curr_price - prev_price) / prev_price) * 100
-                    
-                    if abs(pct_change) > daily_threshold:
-                        violations.append({
-                            'type': 'daily',
-                            'date': curr_date,
-                            'compared_date': prev_date,
-                            'date_val': curr_price,
-                            'compared_date_val': prev_price,
-                            'value_difference': curr_price - prev_price,
-                            'pct_change': round(pct_change, 2)
-                        })
+                violations.extend(self._perform_check(df, index_name, 'daily', self._get_daily_comparison))
             
-            # Weekly checks
             if self.weekly_check:
-                weekly_threshold = self._get_threshold(index_name, 'weekly')
-                for i in range(len(df)):
-                    curr_date = df.loc[i, 'date']
-                    curr_price = df.loc[i, 'price']
-                    
-                    # Find date 7 days ago
-                    target_date = curr_date - timedelta(days=7)
-                    
-                    # Find the closest date >= target_date in the past
-                    prev_rows = df[df['date'] <= target_date]
-                    if len(prev_rows) == 0:
-                        continue
-                    
-                    prev_idx = prev_rows.index[-1]
-                    prev_date = df.loc[prev_idx, 'date']
-                    prev_price = df.loc[prev_idx, 'price']
-                    
-                    pct_change = ((curr_price - prev_price) / prev_price) * 100
-                    
-                    if abs(pct_change) > weekly_threshold:
-                        violations.append({
-                            'type': 'weekly',
-                            'date': curr_date,
-                            'compared_date': prev_date,
-                            'date_val': curr_price,
-                            'compared_date_val': prev_price,
-                            'value_difference': curr_price - prev_price,
-                            'pct_change': round(pct_change, 2)
-                        })
+                violations.extend(self._perform_check(df, index_name, 'weekly', self._get_weekly_comparison))
             
             violations_df = pd.DataFrame(violations) if violations else pd.DataFrame()
             
@@ -194,34 +177,22 @@ def parse_arguments():
     parser.add_argument('--weekly-threshold', type=float,
                         help='Global weekly threshold (percent) - overrides config')
     
-    # Index-specific overrides
-    parser.add_argument('--sp500-daily', type=float, dest='sp500_daily',
-                        help='SP500 daily threshold')
-    parser.add_argument('--sp500-weekly', type=float, dest='sp500_weekly',
-                        help='SP500 weekly threshold')
-    parser.add_argument('--djia-daily', type=float, dest='djia_daily',
-                        help='DJIA daily threshold')
-    parser.add_argument('--djia-weekly', type=float, dest='djia_weekly',
-                        help='DJIA weekly threshold')
-    parser.add_argument('--djca-daily', type=float, dest='djca_daily',
-                        help='DJCA daily threshold')
-    parser.add_argument('--djca-weekly', type=float, dest='djca_weekly',
-                        help='DJCA weekly threshold')
-    parser.add_argument('--djta-daily', type=float, dest='djta_daily',
-                        help='DJTA daily threshold')
-    parser.add_argument('--djta-weekly', type=float, dest='djta_weekly',
-                        help='DJTA weekly threshold')
-    parser.add_argument('--djua-daily', type=float, dest='djua_daily',
-                        help='DJUA daily threshold')
-    parser.add_argument('--djua-weekly', type=float, dest='djua_weekly',
-                        help='DJUA weekly threshold')
+    # Index-specific overrides (dynamically generated)
+    for index in INDEXES:
+        parser.add_argument(f'--{index.lower()}-daily', type=float, 
+                          dest=f'{index.lower()}_daily',
+                          help=f'{index} daily threshold')
+        parser.add_argument(f'--{index.lower()}-weekly', type=float,
+                          dest=f'{index.lower()}_weekly',
+                          help=f'{index} weekly threshold')
     
     return parser.parse_args()
 
 
+
 def create_output_directory():
     """Create timestamped output directory."""
-    timestamp = datetime.now().strftime('%Y-%m-%d')
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     unique_id = str(uuid.uuid4())[:8]
     output_dir = Path('results') / f'results_{timestamp}_{unique_id}'
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -233,14 +204,10 @@ def write_results_csv(df: pd.DataFrame, index_name: str, thresholds: Dict, outpu
     output_file = output_dir / f'{index_name}.csv'
     
     with open(output_file, 'w') as f:
-        # Write header with thresholds
         f.write(f'# Index: {index_name}, Daily Threshold: {thresholds["daily"]}%, Weekly Threshold: {thresholds["weekly"]}%\n')
-        
-        # Write column headers
         f.write('type,date,compared_date,date_val,compared_date_val,value_difference,pct_change\n')
         
         if not df.empty:
-            # Format and write data rows
             for _, row in df.iterrows():
                 f.write(f"{row['type']},{row['date'].strftime('%Y-%m-%d')},{row['compared_date'].strftime('%Y-%m-%d')},{row['date_val']},{row['compared_date_val']},{row['value_difference']},{row['pct_change']}\n")
 
@@ -248,7 +215,6 @@ def write_results_csv(df: pd.DataFrame, index_name: str, thresholds: Dict, outpu
 def main():
     args = parse_arguments()
     
-    # Determine which checks to run
     daily_check = not args.weekly_only
     weekly_check = not args.daily_only
     
@@ -256,25 +222,17 @@ def main():
         print("Error: Cannot disable both daily and weekly checks")
         sys.exit(1)
     
-    # Load configuration
     config = PipelineConfig()
     
     # Build index-specific overrides from CLI args
     index_overrides = {}
-    for index in ['SP500', 'DJIA', 'DJCA', 'DJTA', 'DJUA']:
-        daily_key = f'{index.lower()}_daily'
-        weekly_key = f'{index.lower()}_weekly'
-        
-        daily_val = getattr(args, daily_key, None)
-        weekly_val = getattr(args, weekly_key, None)
+    for index in INDEXES:
+        daily_val = getattr(args, f'{index.lower()}_daily', None)
+        weekly_val = getattr(args, f'{index.lower()}_weekly', None)
         
         if daily_val is not None or weekly_val is not None:
-            index_overrides[index] = {
-                'daily': daily_val,
-                'weekly': weekly_val
-            }
+            index_overrides[index] = {'daily': daily_val, 'weekly': weekly_val}
     
-    # Create processor
     processor = StockDataProcessor(
         config=config,
         daily=daily_check,
@@ -284,11 +242,9 @@ def main():
         index_overrides=index_overrides
     )
     
-    # Create output directory
     output_dir = create_output_directory()
     print(f"Output directory: {output_dir}\n")
     
-    # Process all CSV files
     data_dir = Path('Data')
     csv_files = sorted(data_dir.glob('*.csv'))
     
@@ -301,7 +257,6 @@ def main():
     
     for csv_file in csv_files:
         index_name = csv_file.stem
-        
         print(f"Processing {csv_file.name}...", end=' ')
         
         violations_df, result = processor.process_file(str(csv_file), index_name)
@@ -316,7 +271,6 @@ def main():
             print(f"OK ({violation_count} violations)")
             processed.append((index_name, violation_count))
     
-    # Print summary
     print("\n" + "="*50)
     print("SUMMARY")
     print("="*50)
