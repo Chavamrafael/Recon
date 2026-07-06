@@ -1,0 +1,21 @@
+global:
+  daily_threshold: 1.0      # Default: 1%
+  weekly_threshold: 5.0     # Default: 5%
+
+indexes:
+  SP500:
+    # Uncomment to override global defaults
+    # daily_threshold: 1.5
+    # weekly_threshold: 5.0
+  DJIA:
+    # daily_threshold: 1.0
+    # weekly_threshold: 5.0
+  DJCA:
+    # daily_threshold: 1.0
+    # weekly_threshold: 5.0
+  DJTA:
+    # daily_threshold: 1.0
+    # weekly_threshold: 5.0
+  DJUA:
+    # daily_threshold: 1.0
+    # weekly_threshold: 5.0
